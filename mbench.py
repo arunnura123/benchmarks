@@ -1,38 +1,6 @@
 
 #!/usr/bin/env python3
 
-
-Compares two fundamentally different KV cache strategies:
-
-  paged  - vLLM default: scattered block allocation + paged attention kernel.
-           No reallocation needed, but every attention step pays for block-table
-           indirection and non-contiguous memory access.
-
-  bmc    - Block-Managed Contiguous: maintains a contiguous KV tensor so it
-           can directly leverage Flash Attention (torch SDPA).  The cache is
-           pre-allocated with sqrt(N) headroom; when capacity is exhausted
-           (every ~sqrt(N) decode steps), a new contiguous tensor is allocated
-           and the live data is copied over.  The bet is that Flash Attention
-           speed > periodic realloc+copy cost.
-
-Usage:
-  # Default sweep (row conflicts ON, smaller ctx + longer decode)
-  python mbench.py --mode both
-
-  # GQA model
-  python mbench.py --model-config llama-3-8b
-
-  # Custom sweep
-  python mbench.py \\
-      --context-lengths 512 1024 2048 4096 8192 \\
-      --decode-lengths  1024 2048 4096 \\
-      --batch-size 8
-
-  python mbench.py --dtype float16
-  python mbench.py --no-row-conflicts
-  python mbench.py --csv results.csv
-"""
-
 import argparse
 import csv
 import math
