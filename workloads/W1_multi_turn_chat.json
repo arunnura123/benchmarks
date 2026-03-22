@@ -1,0 +1,19 @@
+{
+    "id": "W1",
+    "name": "Multi-Turn Chat",
+    "description": "Shared system prompt + 10 conversation rounds with CPU offload between turns. Models a conversational assistant serving concurrent users. Adapted from LMCache multi_round_qa.",
+    "reference": "LMCache (arXiv:2510.09665)",
+    "context_len": 2048,
+    "rounds": [
+        {"decode": 300, "offload": true, "comment": "Round 1: greeting + initial response"},
+        {"decode": 280, "offload": true, "comment": "Round 2: follow-up question"},
+        {"decode": 350, "offload": true, "comment": "Round 3: detailed explanation"},
+        {"decode": 260, "offload": true, "comment": "Round 4: clarification"},
+        {"decode": 320, "offload": true, "comment": "Round 5: elaboration"},
+        {"decode": 290, "offload": true, "comment": "Round 6: memory pressure starts"},
+        {"decode": 310, "offload": true, "comment": "Round 7: context grows past 4K"},
+        {"decode": 340, "offload": true, "comment": "Round 8: heavy offload region"},
+        {"decode": 270, "offload": true, "comment": "Round 9: near max context"},
+        {"decode": 300, "offload": true, "comment": "Round 10: final round"}
+    ]
+}

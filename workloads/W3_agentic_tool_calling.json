@@ -1,0 +1,17 @@
+{
+    "id": "W3",
+    "name": "Agentic Tool-Calling",
+    "description": "8 sequential tool calls with variable-length responses and CPU offload between each call. Models AI agent making API requests, web scrapes, and code execution. Exercises the full offload-idle-restore-extend cycle.",
+    "reference": "Georgia Tech & Intel (arXiv:2511.00739), Sekar 2026",
+    "context_len": 512,
+    "rounds": [
+        {"decode": 150,  "offload": true, "comment": "Tool 1: short API response"},
+        {"decode": 800,  "offload": true, "comment": "Tool 2: web scrape result (large)"},
+        {"decode": 50,   "offload": true, "comment": "Tool 3: confirmation call (tiny)"},
+        {"decode": 400,  "offload": true, "comment": "Tool 4: database query result"},
+        {"decode": 1000, "offload": true, "comment": "Tool 5: code execution output (largest)"},
+        {"decode": 200,  "offload": true, "comment": "Tool 6: search results"},
+        {"decode": 600,  "offload": true, "comment": "Tool 7: document retrieval"},
+        {"decode": 100,  "offload": true, "comment": "Tool 8: final validation call"}
+    ]
+}

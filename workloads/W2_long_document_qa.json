@@ -1,0 +1,14 @@
+{
+    "id": "W2",
+    "name": "Long Document QA",
+    "description": "8K-token document context + 5 Q&A rounds with CPU offload between queries. Models RAG pipeline with large KV caches where transfer bandwidth dominates. Adapted from LMCache long_doc_qa.",
+    "reference": "LMCache (arXiv:2510.09665)",
+    "context_len": 8192,
+    "rounds": [
+        {"decode": 200, "offload": true, "comment": "Query 1: summarization"},
+        {"decode": 180, "offload": true, "comment": "Query 2: factual extraction"},
+        {"decode": 220, "offload": true, "comment": "Query 3: reasoning over document"},
+        {"decode": 190, "offload": true, "comment": "Query 4: comparison question"},
+        {"decode": 210, "offload": true, "comment": "Query 5: final synthesis"}
+    ]
+}
