@@ -26,6 +26,11 @@ def main():
     p.add_argument("--block-sizes", type=int, nargs="+", default=[16, 32, 64, 128, 256])
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     p.add_argument("--num-runs", type=int, default=3)
+    p.add_argument("--steady-lengths", type=int, nargs="+", default=[],
+                   help="If set, use FIXED-LENGTH steady-state timing (plan once, no growth) "
+                        "at these lengths — clean block-size comparison without host-side noise.")
+    p.add_argument("--steady-steps", type=int, default=64,
+                   help="Timed decode steps per config in steady-state mode.")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -55,6 +60,31 @@ def main():
                                  cfg["head_dim"], device, dtype) for _ in range(cfg["num_layers"])]
     torch.cuda.synchronize()
 
+    # ── steady-state: fixed length, plan once, per-step latency (clean block-size numbers) ──
+    if args.steady_lengths:
+        print(f"  mode: STEADY-STATE (fixed length, plan once, {args.steady_steps} timed steps/config)")
+        for bs in args.batch_sizes:
+            print(f"\n  {'═'*92}\n  Batch size = {bs}\n  {'═'*92}")
+            hdr = f"  {'Len':>6} {'BS':>4} │ " + " ".join(f"blk{b:>4}(ms)" for b in blks) + \
+                  " │ " + " ".join(f"{b:>3}GB" for b in blks)
+            print(hdr); print(f"  {'─'*(len(hdr))}")
+            for length in args.steady_lengths:
+                ms_row, gb_row = [], []
+                for blk in blks:
+                    times, peak = [], 0.0
+                    for _ in range(args.num_runs):
+                        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+                        ms, peak = B.run_steady("paged", layers, cfg, bs, length, blk,
+                                                dtype, device, steps=args.steady_steps)
+                        times.append(ms)
+                    ms_row.append(statistics.median(times)); gb_row.append(peak)
+                ms_str = " ".join(f"{m:>9.3f}" for m in ms_row)
+                gb_str = " ".join(f"{g:>4.1f}" for g in gb_row)
+                print(f"  {length:>6} {bs:>4} │ {ms_str} │ {gb_str}")
+            print(f"  {'─'*(len(hdr))}")
+        print("\nDone.")
+        return
+
     for bs in args.batch_sizes:
         print(f"\n  {'═'*92}\n  Batch size = {bs}\n  {'═'*92}")
         hdr = f"  {'In':>5} {'Out':>5} {'BS':>4} │ " + " ".join(f"blk{b:>4}(ms)" for b in blks) + \
@@ -69,7 +99,7 @@ def main():
                         torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
                         ms, _ra, peak = B.run_mode("paged", layers, cfg, bs, ctx, dec, blk, dtype, device)
                         times.append(ms)
-                    ms_row.append(statistics.mean(times)); gb_row.append(peak)
+                    ms_row.append(statistics.median(times)); gb_row.append(peak)
                 ms_str = " ".join(f"{m:>9.1f}" for m in ms_row)
                 gb_str = " ".join(f"{g:>4.1f}" for g in gb_row)
                 print(f"  {ctx:>5} {dec:>5} {bs:>4} │ {ms_str} │ {gb_str}")
