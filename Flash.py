@@ -135,16 +135,18 @@ class KVContiguous(KVBase):
         self.kv_list = [torch.zeros(self.B, 2, self.cap, self.HKV, self.D, dtype=self.dtype, device=self.device)
                         for _ in range(self.L)]
         self.brange = torch.arange(self.B, device=self.device)
+        # geometry is constant across steps except last_page_len -> preallocate once
+        self._indptr = torch.arange(self.B + 1, device=self.device, dtype=torch.int32)   # 1 page/seq
+        self._indices = torch.arange(self.B, device=self.device, dtype=torch.int32)
+        self._last = torch.empty(self.B, dtype=torch.int32, device=self.device)
 
     def write(self, i, pos, k, v):
         self.kv_list[i][self.brange, 0, pos, :, :] = k
         self.kv_list[i][self.brange, 1, pos, :, :] = v
 
     def geometry(self, new_len):
-        indptr = torch.arange(self.B + 1, device=self.device, dtype=torch.int32)   # 1 page/seq
-        indices = torch.arange(self.B, device=self.device, dtype=torch.int32)
-        last = torch.full((self.B,), new_len, dtype=torch.int32, device=self.device)
-        return indptr, indices, last, self.page_size
+        self._last.fill_(new_len)
+        return self._indptr, self._indices, self._last, self.page_size
 
 
 class KVPaged(KVBase):
@@ -157,6 +159,11 @@ class KVPaged(KVBase):
         self.kv_list = [torch.zeros(self.num_pages, 2, block_size, self.HKV, self.D, dtype=self.dtype, device=self.device)
                         for _ in range(self.L)]
         self.base = torch.arange(self.B, device=self.device, dtype=torch.int32) * self.ppr
+        # preallocate geometry buffers once; slice/update in place per step (no per-step alloc)
+        ar = torch.arange(self.ppr, device=self.device, dtype=torch.int32)
+        self._full_idx = self.base.view(self.B, 1) + ar.view(1, self.ppr)          # [B, ppr] global page ids
+        self._indptr_unit = torch.arange(self.B + 1, device=self.device, dtype=torch.int32)
+        self._last = torch.empty(self.B, dtype=torch.int32, device=self.device)
 
     def write(self, i, pos, k, v):
         gp = (self.base + pos // self.page_size).long()
@@ -167,11 +174,10 @@ class KVPaged(KVBase):
     def geometry(self, new_len):
         active = math.ceil(new_len / self.page_size)
         last = ((new_len - 1) % self.page_size) + 1
-        indptr = torch.arange(self.B + 1, device=self.device, dtype=torch.int32) * active
-        ar = torch.arange(active, device=self.device, dtype=torch.int32)
-        indices = torch.cat([self.base[b] + ar for b in range(self.B)])
-        last_t = torch.full((self.B,), last, dtype=torch.int32, device=self.device)
-        return indptr, indices, last_t, self.page_size
+        indptr = self._indptr_unit * active                        # [B+1]
+        indices = self._full_idx[:, :active].reshape(-1)           # active pages/seq, no Python loop
+        self._last.fill_(last)
+        return indptr, indices, self._last, self.page_size
 
 
 class KVBmc(KVBase):
@@ -184,6 +190,9 @@ class KVBmc(KVBase):
         self.kv_list = [torch.zeros(self.B, 2, self.cap, self.HKV, self.D, dtype=self.dtype, device=self.device)
                         for _ in range(self.L)]
         self.brange = torch.arange(self.B, device=self.device)
+        self._indptr = torch.arange(self.B + 1, device=self.device, dtype=torch.int32)
+        self._indices = torch.arange(self.B, device=self.device, dtype=torch.int32)
+        self._last = torch.empty(self.B, dtype=torch.int32, device=self.device)
 
     def maybe_grow(self):
         if self.seq_len + 1 > self.cap:
@@ -202,10 +211,8 @@ class KVBmc(KVBase):
         self.kv_list[i][self.brange, 1, pos, :, :] = v
 
     def geometry(self, new_len):
-        indptr = torch.arange(self.B + 1, device=self.device, dtype=torch.int32)
-        indices = torch.arange(self.B, device=self.device, dtype=torch.int32)
-        last = torch.full((self.B,), new_len, dtype=torch.int32, device=self.device)
-        return indptr, indices, last, self.page_size
+        self._last.fill_(new_len)
+        return self._indptr, self._indices, self._last, self.page_size
 
 
 # ─────────────────────────── decode step (kernel held constant) ───────────────────────────
@@ -244,7 +251,7 @@ def run_mode(mode, layers, cfg, batch, ctx, dec, block_size, dtype, device):
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(_FI_WORKSPACE, "NHD")
     hidden = torch.randn(batch, 1, cfg["hidden"], dtype=dtype, device=device)
 
-    for _ in range(3):
+    for _ in range(5):
         decode_step(hidden, layers, kv, wrapper, scale)
     torch.cuda.synchronize()
     kv.seq_len = ctx; kv.reallocs = 0
@@ -259,6 +266,61 @@ def run_mode(mode, layers, cfg, batch, ctx, dec, block_size, dtype, device):
     return ms, reallocs, peak
 
 
+# ─────────────────────────── steady-state (plan once, fixed length) ───────────────────────────
+def run_steady(mode, layers, cfg, batch, length, block_size, dtype, device, steps=64, warmup=16):
+    """Isolate the per-step DECODE cost at a FIXED sequence length.
+
+    Prefills capacity to `length`, plans the FlashInfer wrapper ONCE for that
+    geometry, then times `steps` decode iterations that write at the tail slot
+    (overwrite) instead of growing. No per-step planning, no allocation, no
+    realloc/copy — so the number reflects steady-state kernel + layer cost only.
+    This is the clean way to compare paged block sizes without host-side noise.
+    """
+    import flashinfer
+    scale = cfg["head_dim"] ** -0.5
+    L = len(layers)
+    if mode == "contiguous":
+        kv = KVContiguous(L, batch, cfg["num_kv_heads"], cfg["head_dim"], length, 0, dtype, device)
+    elif mode == "paged":
+        kv = KVPaged(L, batch, cfg["num_kv_heads"], cfg["head_dim"], length, 0, dtype, device, block_size=block_size)
+    else:
+        kv = KVBmc(L, batch, cfg["num_kv_heads"], cfg["head_dim"], length, 0, dtype, device)
+    kv.seq_len = length
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(_FI_WORKSPACE, "NHD")
+    indptr, indices, last, page_size = kv.geometry(length)   # plan ONCE for fixed length
+    L0 = layers[0]
+    _plan(wrapper, indptr, indices, last, L0.num_heads, L0.num_kv_heads, L0.head_dim, page_size, dtype, scale)
+
+    hidden = torch.randn(batch, 1, cfg["hidden"], dtype=dtype, device=device)
+    pos = length - 1   # overwrite tail every step -> length stays fixed, plan stays valid
+
+    def one_step(h):
+        for i, layer in enumerate(layers):
+            residual = h
+            x = layer.norm1(h)
+            q, k_new, v_new = layer.qkv_proj(x)
+            kv.write(i, pos, k_new.view(batch, layer.num_kv_heads, layer.head_dim),
+                            v_new.view(batch, layer.num_kv_heads, layer.head_dim))
+            o = wrapper.run(q.view(batch, layer.num_heads, layer.head_dim), kv.kv(i))
+            h = F.linear(o.view(batch, 1, -1), layer.qkv_proj.o) + residual
+            residual = h
+            h = layer.ffn(layer.norm2(h)) + residual
+        return h
+
+    for _ in range(warmup):
+        hidden = one_step(hidden)
+    torch.cuda.synchronize()
+
+    timer = CudaTimer(); timer.start()
+    for _ in range(steps):
+        hidden = one_step(hidden)
+    ms = timer.stop()
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    del kv; torch.cuda.empty_cache()
+    return ms / steps, peak   # per-step ms
+
+
 # ─────────────────────────── main ───────────────────────────
 def main():
     global _FI_WORKSPACE
@@ -271,6 +333,11 @@ def main():
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     p.add_argument("--num-runs", type=int, default=3)
+    p.add_argument("--steady-lengths", type=int, nargs="+", default=[],
+                   help="If set, run FIXED-LENGTH steady-state mode at these lengths "
+                        "(plan once, no growth) instead of the growth benchmark.")
+    p.add_argument("--steady-steps", type=int, default=64,
+                   help="Timed decode steps per config in steady-state mode.")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -278,7 +345,11 @@ def main():
     try:
         import flashinfer  # noqa
     except ImportError:
-        sys.exit("ERROR: flashinfer not installed (pip install flashinfer).")
+        sys.exit("ERROR: flashinfer not installed. Install with:\n"
+                 "  pip install flashinfer-python\n"
+                 "  (or a CUDA-matched wheel: pip install flashinfer-python "
+                 "-i https://flashinfer.ai/whl/cu124/torch2.6/)\n"
+                 "  NOTE: FlashInfer is CUDA-only — it will not run on AMD/ROCm (e.g. MI300x).")
 
     cfg = dict(MODEL_CONFIGS[args.model_config])
     if args.num_layers > 0: cfg["num_layers"] = args.num_layers
@@ -297,6 +368,32 @@ def main():
     torch.cuda.synchronize()
     modes = ["contiguous", "paged", "bmc"]
 
+    # ── steady-state mode: plan once, fixed length, per-step latency ──
+    if args.steady_lengths:
+        print(f"  mode: STEADY-STATE (fixed length, plan once, {args.steady_steps} timed steps/config, "
+              f"block_size={args.block_size})")
+        for bs in args.batch_sizes:
+            print(f"\n  {'═'*70}\n  Batch size = {bs}\n  {'═'*70}")
+            print(f"  {'Len':>6} {'BS':>4} │ {'Contig(ms)':>11} {'Paged(ms)':>10} {'BMC(ms)':>9} │ "
+                  f"{'C_GB':>5} {'P_GB':>5} {'B_GB':>5}")
+            print(f"  {'─'*70}")
+            for length in args.steady_lengths:
+                res = {}
+                for mode in modes:
+                    times = []; peak = 0
+                    for _ in range(args.num_runs):
+                        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+                        ms, peak = run_steady(mode, layers, cfg, bs, length,
+                                              args.block_size, dtype, device, steps=args.steady_steps)
+                        times.append(ms)
+                    res[mode] = (statistics.median(times), peak)
+                c_ms, c_gb = res["contiguous"]; p_ms, p_gb = res["paged"]; b_ms, b_gb = res["bmc"]
+                print(f"  {length:>6} {bs:>4} │ {c_ms:>11.3f} {p_ms:>10.3f} {b_ms:>9.3f} │ "
+                      f"{c_gb:>4.1f}G {p_gb:>4.1f}G {b_gb:>4.1f}G")
+            print(f"  {'─'*70}")
+        print("\nDone.")
+        return
+
     for bs in args.batch_sizes:
         print(f"\n  {'═'*88}\n  Batch size = {bs}\n  {'═'*88}")
         print(f"  {'In':>5} {'Out':>5} {'BS':>4} │ {'Contig(ms)':>11} {'Paged(ms)':>10} {'BMC(ms)':>9} │ "
@@ -312,7 +409,7 @@ def main():
                         ms, ra, peak = run_mode(mode, layers, cfg, bs, ctx, dec,
                                                 args.block_size, dtype, device)
                         times.append(ms)
-                    res[mode] = (statistics.mean(times), peak, ra)
+                    res[mode] = (statistics.median(times), peak, ra)
                 c_ms, c_gb, _ = res["contiguous"]; p_ms, p_gb, _ = res["paged"]; b_ms, b_gb, b_ra = res["bmc"]
                 print(f"  {ctx:>5} {dec:>5} {bs:>4} │ {c_ms:>11.1f} {p_ms:>10.1f} {b_ms:>9.1f} │ "
                       f"{c_gb:>4.1f}G {p_gb:>4.1f}G {b_gb:>4.1f}G {b_ra:>4}")
